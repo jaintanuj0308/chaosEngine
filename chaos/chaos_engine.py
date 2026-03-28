@@ -11,7 +11,7 @@ Entry point: inject_chaos_safe(service, scenario) -> dict
 import os
 import subprocess
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, Any, List, Tuple
 
 # ─────────────────────────────────────────────
@@ -58,17 +58,18 @@ _KIND_TO_CRD: Dict[str, str] = {
 # ─────────────────────────────────────────────
 def _now_iso() -> str:
     """Return current UTC time as an ISO-8601 string."""
+    from datetime import timezone
     return datetime.now(timezone.utc).isoformat()
 
 
-def _run(cmd: List[str], stdin_data: str = "") -> subprocess.CompletedProcess:
+def _run(cmd: List[str], stdin_data: str = "", timeout: int = 30) -> subprocess.CompletedProcess:
     """Run a shell command and return the CompletedProcess result."""
     return subprocess.run(
         cmd,
         input=stdin_data if stdin_data else None,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=timeout,
     )
 
 
@@ -84,15 +85,15 @@ def check_chaos_mesh_available() -> bool:
     Returns False otherwise (Chaos Mesh absent or cluster unreachable).
     """
     try:
-        result = _run(["kubectl", "get", "pods", "-n", CHAOS_NAMESPACE])
+        result = _run(["kubectl", "get", "pods", "-n", CHAOS_NAMESPACE], timeout=5)
         available = result.returncode == 0 and "chaos" in result.stdout.lower()
         if available:
-            print("[CHAOS] OK  Chaos Mesh available")
+            print("[CHAOS] ✅ Chaos Mesh available")
         else:
-            print("[CHAOS] WARN Chaos Mesh not found - running in fallback mode")
+            print("[CHAOS] ⚠️  Chaos Mesh not found — running in fallback mode")
         return available
     except Exception as exc:
-        print(f"[CHAOS] WARN Could not reach cluster: {exc}")
+        print(f"[CHAOS] ⚠️  Could not reach cluster: {exc}")
         return False
 
 
@@ -136,7 +137,7 @@ def inject_chaos(service: str, scenario: str) -> Dict[str, Any]:
 
     # ── Guard critical services ───────────────
     if service in CRITICAL_SERVICES:
-        print(f"[CHAOS] BLOCK Blocked: '{service}' is a critical service.")
+        print(f"[CHAOS] 🛑 Blocked: '{service}' is a critical service.")
         return {
             "success": False,
             "reason": "critical_service_protected",
@@ -161,11 +162,13 @@ def inject_chaos(service: str, scenario: str) -> Dict[str, Any]:
     manifest_content = manifest_content.replace("SERVICE_PLACEHOLDER", service)
 
     # ── Apply via kubectl ─────────────────────
-    print(f"[CHAOS] GO Injecting '{scenario}' into '{service}'...")
+    print(f"[CHAOS] 🚀 Injecting '{scenario}' into '{service}'...")
     try:
-        result = _run(["kubectl", "apply", "-f", "-"], stdin_data=manifest_content)
+        result = _run(["kubectl", "apply", "-f", "-"], stdin_data=manifest_content, timeout=10)
     except subprocess.TimeoutExpired:
         return {"success": False, "reason": "kubectl_timeout", "service": service, "scenario": scenario}
+    except FileNotFoundError:
+        return {"success": False, "reason": "kubectl_not_found", "service": service, "scenario": scenario}
 
     if result.returncode != 0:
         return {
@@ -177,7 +180,7 @@ def inject_chaos(service: str, scenario: str) -> Dict[str, Any]:
         }
 
     duration = 30 if scenario == "pod_kill" else 60
-    print(f"[CHAOS] OK '{scenario}' injected into '{service}' for {duration}s.")
+    print(f"[CHAOS] ✅ '{scenario}' injected into '{service}'")
     return {
         "success": True,
         "service": service,
@@ -208,7 +211,7 @@ def cleanup_chaos(scenario: str) -> Dict[str, Any]:
     _, kind, resource_name = SCENARIO_MANIFEST[scenario]
     crd_type = _KIND_TO_CRD.get(kind, kind.lower())
 
-    print(f"[CHAOS] CLEAN Cleaning up '{scenario}' ({crd_type}/{resource_name})...")
+    print(f"[CHAOS] 🧹 Cleaned up {scenario}")
     try:
         result = _run([
             "kubectl", "delete", crd_type, resource_name,
@@ -230,7 +233,6 @@ def cleanup_chaos(scenario: str) -> Dict[str, Any]:
             "stderr": result.stderr.strip(),
         }
 
-    print(f"[CHAOS] OK Cleaned up '{scenario}'.")
     return {"success": True, "scenario": scenario}
 
 
@@ -244,13 +246,11 @@ def cleanup_all() -> Dict[str, Any]:
     Returns:
         dict: cleaned (count), total (count), scenarios (list of results).
     """
-    print("[CHAOS] CLEAN Cleaning up ALL chaos experiments...")
     results: List[Dict[str, Any]] = []
     for scenario in SCENARIO_MANIFEST:
         results.append(cleanup_chaos(scenario))
 
     cleaned = sum(1 for r in results if r.get("success"))
-    print(f"[CHAOS] OK Cleanup complete: {cleaned}/{len(results)} removed.")
     return {
         "cleaned": cleaned,
         "total": len(results),
@@ -273,14 +273,13 @@ def fallback_pod_kill(service: str) -> Dict[str, Any]:
     Returns:
         dict with keys: success, pod_deleted, service, method.
     """
-    print(f"[CHAOS] FALLBACK kubectl pod kill for '{service}'...")
     try:
         # Step 1: find the first pod
         get_result = _run([
             "kubectl", "get", "pods",
             "-n", NAMESPACE,
             "-l", f"app={service}",
-            "-o", "jsonpath={.items[0].metadata.name}",
+            "-o", "jsonpath='{.items[0].metadata.name}'",
         ])
 
         if get_result.returncode != 0 or not get_result.stdout.strip():
@@ -291,7 +290,8 @@ def fallback_pod_kill(service: str) -> Dict[str, Any]:
                 "method": "kubectl_fallback",
             }
 
-        pod_name = get_result.stdout.strip()
+        # Remove quotes that might be around the string due to jsonpath
+        pod_name = get_result.stdout.strip().strip("'").strip('"')
 
         # Step 2: delete the pod
         del_result = _run(["kubectl", "delete", "pod", pod_name, "-n", NAMESPACE])
@@ -305,7 +305,7 @@ def fallback_pod_kill(service: str) -> Dict[str, Any]:
                 "stderr": del_result.stderr.strip(),
             }
 
-        print(f"[CHAOS] OK Fallback: deleted pod '{pod_name}'.")
+        print(f"[CHAOS] ⚡ Fallback pod kill: {pod_name}")
         return {
             "success": True,
             "pod_deleted": pod_name,
@@ -343,10 +343,9 @@ def inject_chaos_safe(service: str, scenario: str) -> Dict[str, Any]:
     Returns:
         dict describing result.  Always contains 'success' bool.
     """
-    print(f"[CHAOS] >> inject_chaos_safe({service!r}, {scenario!r})")
-
     # Guard critical services early (before Chaos Mesh check)
     if service in CRITICAL_SERVICES:
+        print(f"[CHAOS] 🛑 Blocked: '{service}' is a critical service.")
         return {
             "success": False,
             "reason": "critical_service_protected",
@@ -360,10 +359,10 @@ def inject_chaos_safe(service: str, scenario: str) -> Dict[str, Any]:
 
     # Fallback path
     if scenario == "pod_kill":
-        print("[CHAOS] FALLBACK Chaos Mesh unavailable - using kubectl fallback for pod_kill.")
+        print("[CHAOS] 🔧 Chaos Mesh unavailable — using kubectl fallback for pod_kill.")
         return fallback_pod_kill(service)
 
-    print(f"[CHAOS] ERROR Chaos Mesh unavailable and '{scenario}' requires Chaos Mesh.")
+    print(f"[CHAOS] ❌ Chaos Mesh unavailable and '{scenario}' requires Chaos Mesh.")
     return {
         "success": False,
         "reason": "chaos_mesh_required_for_this_scenario",
@@ -380,18 +379,18 @@ if __name__ == "__main__":
 
     print("\n=== KubeResilience Chaos Engine Self-Test ===\n")
 
-    print("[1] Checking Chaos Mesh...")
+    print("1️⃣  Checking Chaos Mesh...")
     available = check_chaos_mesh_available()
 
-    print("\n[2] Testing critical service guard...")
+    print("\n2️⃣  Testing critical service guard...")
     result = inject_chaos_safe("frontend", "pod_kill")
     print(_json.dumps(result, indent=2))
 
-    print("\n[3] Dry-run: inject pod_kill into cartservice...")
+    print("\n3️⃣  Dry-run: inject pod_kill into cartservice...")
     result = inject_chaos_safe("cartservice", "pod_kill")
     print(_json.dumps(result, indent=2))
 
-    print("\n[4] Cleanup all...")
+    print("\n4️⃣  Cleanup all...")
     result = cleanup_all()
     print(_json.dumps(result, indent=2))
 
