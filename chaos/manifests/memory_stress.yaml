@@ -1,0 +1,17 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: kuberesilience-memory-stress
+  namespace: chaos-mesh
+spec:
+  mode: one
+  duration: "60s"
+  selector:
+    namespaces:
+      - boutique
+    labelSelectors:
+      app: SERVICE_PLACEHOLDER
+  stressors:
+    memory:
+      workers: 2
+      size: "256MB"
