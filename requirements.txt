@@ -1,9 +1,0 @@
-# KubeResilience Backend - requirements.txt
-kubernetes
-requests
-pytest
-pytest-cov
-PyYAML
-python-dotenv
-fastapi
-uvicorn
