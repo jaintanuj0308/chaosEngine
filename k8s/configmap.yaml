@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kuberesilience-config
+data:
+  LOG_LEVEL: "INFO"
+  K8S_CONTEXT: "cluster-admin"
+  RESILIENCE_MODE: "aggressive"
+  TARGET_NAMESPACE: "default"

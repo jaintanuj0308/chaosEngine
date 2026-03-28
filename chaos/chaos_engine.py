@@ -1,28 +1,21 @@
-"""
-chaos_engine.py — KubeResilience Core Module
-============================================
-Injects controlled chaos into Kubernetes services to test resilience.
-Supports 5 scenarios:  pod_kill | cpu_stress | memory_stress |
-                        network_latency | packet_loss
-
-Entry point: inject_chaos_safe(service, scenario) -> dict
-"""
-
 import os
 import subprocess
 import json
 from datetime import datetime
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any
 
-# ─────────────────────────────────────────────
-# CONSTANTS & CONFIGURATION
-# ─────────────────────────────────────────────
-NAMESPACE: str = "boutique"
-CHAOS_NAMESPACE: str = "chaos-mesh"
+# ============================================================================
+# CONSTANTS
+# ============================================================================
 
-CRITICAL_SERVICES: List[str] = ["frontend", "checkoutservice"]
+NAMESPACE = "boutique"
+CHAOS_NAMESPACE = "chaos-mesh"
 
-ALL_SERVICES: List[str] = [
+# Services we cannot break
+CRITICAL_SERVICES = ["frontend", "checkoutservice"]
+
+# All services in Online Boutique
+ALL_SERVICES = [
     "frontend",
     "cartservice",
     "checkoutservice",
@@ -32,366 +25,322 @@ ALL_SERVICES: List[str] = [
     "recommendationservice",
     "currencyservice",
     "shippingservice",
-    "adservice",
+    "adservice"
 ]
 
-MANIFESTS_DIR: str = os.path.join(os.path.dirname(__file__), "manifests")
+# Path to YAML manifests
+MANIFESTS_DIR = os.path.join(os.path.dirname(__file__), "manifests")
 
-# Maps scenario name → (yaml_file, Chaos Mesh kind, resource_name)
-SCENARIO_MANIFEST: Dict[str, Tuple[str, str, str]] = {
-    "pod_kill":        ("pod_kill.yaml",        "PodChaos",     "kuberesilience-pod-kill"),
-    "cpu_stress":      ("cpu_stress.yaml",       "StressChaos",  "kuberesilience-cpu-stress"),
-    "memory_stress":   ("memory_stress.yaml",    "StressChaos",  "kuberesilience-memory-stress"),
-    "network_latency": ("network_latency.yaml",  "NetworkChaos", "kuberesilience-network-latency"),
-    "packet_loss":     ("packet_loss.yaml",      "NetworkChaos", "kuberesilience-packet-loss"),
+# Maps scenario names to (yaml_file, chaos_kind, resource_name)
+SCENARIO_MANIFEST = {
+    "pod_kill": ("pod_kill.yaml", "PodChaos", "kuberesilience-pod-kill"),
+    "cpu_stress": ("cpu_stress.yaml", "StressChaos", "kuberesilience-cpu-stress"),
+    "memory_stress": ("memory_stress.yaml", "StressChaos", "kuberesilience-memory-stress"),
+    "network_latency": ("network_latency.yaml", "NetworkChaos", "kuberesilience-network-latency"),
+    "packet_loss": ("packet_loss.yaml", "NetworkChaos", "kuberesilience-packet-loss"),
 }
 
-# CRD kind → kubectl resource type
-_KIND_TO_CRD: Dict[str, str] = {
-    "PodChaos":     "podchaos",
-    "StressChaos":  "stresschaos",
-    "NetworkChaos": "networkchaos",
-}
+# ============================================================================
+# FUNCTION 1: Check if Chaos Mesh is available
+# ============================================================================
 
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
-def _now_iso() -> str:
-    """Return current UTC time as an ISO-8601 string."""
-    from datetime import timezone
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _run(cmd: List[str], stdin_data: str = "", timeout: int = 30) -> subprocess.CompletedProcess:
-    """Run a shell command and return the CompletedProcess result."""
-    return subprocess.run(
-        cmd,
-        input=stdin_data if stdin_data else None,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-
-
-# ─────────────────────────────────────────────
-# FUNCTION 1 — Availability Check
-# ─────────────────────────────────────────────
 def check_chaos_mesh_available() -> bool:
     """
-    Check whether Chaos Mesh is installed and running on the cluster.
-
-    Runs: kubectl get pods -n chaos-mesh
-    Returns True  if pods are found with 'chaos' in their names.
-    Returns False otherwise (Chaos Mesh absent or cluster unreachable).
+    Check if Chaos Mesh is running and accessible.
+    
+    Returns:
+        True if Chaos Mesh pods are running, False otherwise
     """
     try:
-        result = _run(["kubectl", "get", "pods", "-n", CHAOS_NAMESPACE], timeout=5)
-        available = result.returncode == 0 and "chaos" in result.stdout.lower()
-        if available:
-            print("[CHAOS] ✅ Chaos Mesh available")
+        result = subprocess.run(
+            ["kubectl", "get", "pods", "-n", "chaos-mesh"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        if result.returncode == 0 and "chaos" in result.stdout:
+            print("✅ Chaos Mesh available")
+            return True
         else:
-            print("[CHAOS] ⚠️  Chaos Mesh not found — running in fallback mode")
-        return available
-    except Exception as exc:
-        print(f"[CHAOS] ⚠️  Could not reach cluster: {exc}")
+            print("⚠️  Chaos Mesh not found — fallback mode active")
+            return False
+    except Exception as e:
+        print(f"⚠️  Chaos Mesh check failed ({e}) — fallback mode active")
         return False
 
+# ============================================================================
+# FUNCTION 2: Inject chaos (core logic)
+# ============================================================================
 
-# ─────────────────────────────────────────────
-# FUNCTION 2 — Core Injection
-# ─────────────────────────────────────────────
 def inject_chaos(service: str, scenario: str) -> Dict[str, Any]:
     """
-    Inject a chaos experiment into *service* using the named *scenario*.
-
-    Steps:
-      1. Validate service and scenario.
-      2. Reject critical services.
-      3. Read YAML manifest and substitute SERVICE_PLACEHOLDER.
-      4. Apply via ``kubectl apply -f -`` (piped stdin).
-
+    Inject a chaos scenario into a service using Chaos Mesh.
+    
     Args:
-        service:  Name of the target microservice (must be in ALL_SERVICES).
-        scenario: Chaos scenario key (must be in SCENARIO_MANIFEST).
-
+        service: Target service name (e.g., 'cartservice')
+        scenario: Chaos scenario (e.g., 'pod_kill', 'cpu_stress')
+    
     Returns:
-        dict with keys: success, service, scenario, timestamp, method,
-        duration_seconds — or error keys on failure.
+        Dictionary with success status and details
     """
-    # ── Validate ─────────────────────────────
+    # Validation: Is this a known service?
     if service not in ALL_SERVICES:
         return {
             "success": False,
             "reason": "unknown_service",
-            "service": service,
-            "valid_services": ALL_SERVICES,
+            "service": service
         }
-
+    
+    # Validation: Is this a known scenario?
     if scenario not in SCENARIO_MANIFEST:
         return {
             "success": False,
             "reason": "unknown_scenario",
-            "scenario": scenario,
-            "valid_scenarios": list(SCENARIO_MANIFEST.keys()),
+            "scenario": scenario
         }
-
-    # ── Guard critical services ───────────────
+    
+    # Safety: Don't break critical services
     if service in CRITICAL_SERVICES:
-        print(f"[CHAOS] 🛑 Blocked: '{service}' is a critical service.")
         return {
             "success": False,
             "reason": "critical_service_protected",
-            "service": service,
+            "service": service
         }
-
-    # ── Load manifest ─────────────────────────
-    yaml_file, kind, resource_name = SCENARIO_MANIFEST[scenario]
-    manifest_path = os.path.join(MANIFESTS_DIR, yaml_file)
-
+    
     try:
-        with open(manifest_path, "r", encoding="utf-8") as fh:
-            manifest_content = fh.read()
-    except FileNotFoundError:
-        return {
-            "success": False,
-            "reason": "manifest_not_found",
-            "path": manifest_path,
-        }
-
-    # ── Substitute placeholder ────────────────
-    manifest_content = manifest_content.replace("SERVICE_PLACEHOLDER", service)
-
-    # ── Apply via kubectl ─────────────────────
-    print(f"[CHAOS] 🚀 Injecting '{scenario}' into '{service}'...")
-    try:
-        result = _run(["kubectl", "apply", "-f", "-"], stdin_data=manifest_content, timeout=10)
-    except subprocess.TimeoutExpired:
-        return {"success": False, "reason": "kubectl_timeout", "service": service, "scenario": scenario}
-    except FileNotFoundError:
-        return {"success": False, "reason": "kubectl_not_found", "service": service, "scenario": scenario}
-
-    if result.returncode != 0:
-        return {
-            "success": False,
-            "reason": "kubectl_apply_failed",
-            "service": service,
-            "scenario": scenario,
-            "stderr": result.stderr.strip(),
-        }
-
-    duration = 30 if scenario == "pod_kill" else 60
-    print(f"[CHAOS] ✅ '{scenario}' injected into '{service}'")
-    return {
-        "success": True,
-        "service": service,
-        "scenario": scenario,
-        "timestamp": _now_iso(),
-        "method": "chaos_mesh",
-        "duration_seconds": duration,
-        "resource_name": resource_name,
-    }
-
-
-# ─────────────────────────────────────────────
-# FUNCTION 3 — Cleanup Single Scenario
-# ─────────────────────────────────────────────
-def cleanup_chaos(scenario: str) -> Dict[str, Any]:
-    """
-    Delete the Chaos Mesh resource for a given scenario.
-
-    Args:
-        scenario: The scenario key whose resource should be removed.
-
-    Returns:
-        dict with keys: success, scenario (and error info on failure).
-    """
-    if scenario not in SCENARIO_MANIFEST:
-        return {"success": False, "reason": "unknown_scenario", "scenario": scenario}
-
-    _, kind, resource_name = SCENARIO_MANIFEST[scenario]
-    crd_type = _KIND_TO_CRD.get(kind, kind.lower())
-
-    print(f"[CHAOS] 🧹 Cleaned up {scenario}")
-    try:
-        result = _run([
-            "kubectl", "delete", crd_type, resource_name,
-            "-n", CHAOS_NAMESPACE,
-            "--ignore-not-found",
-        ])
-    except subprocess.TimeoutExpired:
-        return {"success": False, "reason": "kubectl_timeout", "scenario": scenario}
-    except FileNotFoundError:
-        return {"success": False, "reason": "kubectl_not_found", "scenario": scenario}
-    except Exception as exc:
-        return {"success": False, "reason": str(exc), "scenario": scenario}
-
-    if result.returncode != 0:
-        return {
-            "success": False,
-            "reason": "kubectl_delete_failed",
-            "scenario": scenario,
-            "stderr": result.stderr.strip(),
-        }
-
-    return {"success": True, "scenario": scenario}
-
-
-# ─────────────────────────────────────────────
-# FUNCTION 4 — Cleanup All Scenarios
-# ─────────────────────────────────────────────
-def cleanup_all() -> Dict[str, Any]:
-    """
-    Delete Chaos Mesh resources for all 5 scenarios.
-
-    Returns:
-        dict: cleaned (count), total (count), scenarios (list of results).
-    """
-    results: List[Dict[str, Any]] = []
-    for scenario in SCENARIO_MANIFEST:
-        results.append(cleanup_chaos(scenario))
-
-    cleaned = sum(1 for r in results if r.get("success"))
-    return {
-        "cleaned": cleaned,
-        "total": len(results),
-        "scenarios": results,
-    }
-
-
-# ─────────────────────────────────────────────
-# FUNCTION 5 — Fallback Pod Kill (kubectl only)
-# ─────────────────────────────────────────────
-def fallback_pod_kill(service: str) -> Dict[str, Any]:
-    """
-    Kill a pod belonging to *service* using plain kubectl (no Chaos Mesh).
-
-    Used when Chaos Mesh is unavailable and scenario is 'pod_kill'.
-
-    Args:
-        service: Name of the microservice whose pod will be deleted.
-
-    Returns:
-        dict with keys: success, pod_deleted, service, method.
-    """
-    try:
-        # Step 1: find the first pod
-        get_result = _run([
-            "kubectl", "get", "pods",
-            "-n", NAMESPACE,
-            "-l", f"app={service}",
-            "-o", "jsonpath='{.items[0].metadata.name}'",
-        ])
-
-        if get_result.returncode != 0 or not get_result.stdout.strip():
+        # Get the YAML file path
+        yaml_filename, _, _ = SCENARIO_MANIFEST[scenario]
+        manifest_path = os.path.join(MANIFESTS_DIR, yaml_filename)
+        
+        # Read the YAML file
+        with open(manifest_path, 'r') as f:
+            yaml_content = f.read()
+        
+        # Replace SERVICE_PLACEHOLDER with actual service name
+        modified_yaml = yaml_content.replace("SERVICE_PLACEHOLDER", service)
+        
+        # Apply the manifest via kubectl
+        result = subprocess.run(
+            ["kubectl", "apply", "-f", "-"],
+            input=modified_yaml,
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        # Check if it succeeded
+        if result.returncode != 0:
             return {
                 "success": False,
-                "reason": "pod_not_found",
-                "service": service,
-                "method": "kubectl_fallback",
+                "reason": result.stderr
             }
-
-        # Remove quotes that might be around the string due to jsonpath
-        pod_name = get_result.stdout.strip().strip("'").strip('"')
-
-        # Step 2: delete the pod
-        del_result = _run(["kubectl", "delete", "pod", pod_name, "-n", NAMESPACE])
-
-        if del_result.returncode != 0:
-            return {
-                "success": False,
-                "reason": "pod_delete_failed",
-                "service": service,
-                "method": "kubectl_fallback",
-                "stderr": del_result.stderr.strip(),
-            }
-
-        print(f"[CHAOS] ⚡ Fallback pod kill: {pod_name}")
+        
+        # Success! Print confirmation
+        print(f"[CHAOS] ✅ Injected {scenario} into {service}")
+        
+        # Return success response
         return {
             "success": True,
-            "pod_deleted": pod_name,
             "service": service,
-            "timestamp": _now_iso(),
-            "method": "kubectl_fallback",
+            "scenario": scenario,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "method": "chaos_mesh",
+            "duration_seconds": 60
         }
-
-    except subprocess.TimeoutExpired:
-        return {"success": False, "reason": "kubectl_timeout", "service": service, "method": "kubectl_fallback"}
-    except FileNotFoundError:
-        return {"success": False, "reason": "kubectl_not_found", "service": service, "method": "kubectl_fallback"}
-    except Exception as exc:
-        return {"success": False, "reason": str(exc), "service": service, "method": "kubectl_fallback"}
-
-
-# ─────────────────────────────────────────────
-# FUNCTION 6 — Main Entry Point (Safe Wrapper)
-# ─────────────────────────────────────────────
-def inject_chaos_safe(service: str, scenario: str) -> Dict[str, Any]:
-    """
-    **Primary entry point** for all chaos injection.
-
-    Logic:
-      - If Chaos Mesh is available → call inject_chaos().
-      - If Chaos Mesh is NOT available AND scenario == 'pod_kill'
-        → call fallback_pod_kill().
-      - If Chaos Mesh is NOT available AND scenario != 'pod_kill'
-        → return {success: False, reason: "chaos_mesh_required_for_this_scenario"}.
-
-    Args:
-        service:  Target microservice name.
-        scenario: Chaos scenario key.
-
-    Returns:
-        dict describing result.  Always contains 'success' bool.
-    """
-    # Guard critical services early (before Chaos Mesh check)
-    if service in CRITICAL_SERVICES:
-        print(f"[CHAOS] 🛑 Blocked: '{service}' is a critical service.")
+    
+    except Exception as e:
         return {
             "success": False,
-            "reason": "critical_service_protected",
-            "service": service,
+            "reason": str(e)
         }
 
-    chaos_mesh_up = check_chaos_mesh_available()
+# ============================================================================
+# FUNCTION 3: Cleanup a single scenario
+# ============================================================================
 
-    if chaos_mesh_up:
-        return inject_chaos(service, scenario)
+def cleanup_chaos(scenario: str) -> Dict[str, Any]:
+    """
+    Clean up a specific chaos scenario.
+    
+    Args:
+        scenario: Chaos scenario to remove
+    
+    Returns:
+        Dictionary with cleanup status
+    """
+    if scenario not in SCENARIO_MANIFEST:
+        return {
+            "success": False,
+            "reason": "unknown_scenario",
+            "scenario": scenario
+        }
+    
+    try:
+        _, chaos_kind, resource_name = SCENARIO_MANIFEST[scenario]
+        
+        # Convert kind to lowercase kubectl resource name
+        kind_map = {
+            "PodChaos": "podchaos",
+            "StressChaos": "stresschaos",
+            "NetworkChaos": "networkchaos"
+        }
+        
+        kubectl_kind = kind_map[chaos_kind]
+        
+        # Delete the resource
+        result = subprocess.run(
+            ["kubectl", "delete", kubectl_kind, resource_name, 
+             "-n", "chaos-mesh", "--ignore-not-found"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        print(f"[CHAOS] 🧹 Cleaned up {scenario}")
+        
+        return {
+            "success": result.returncode == 0,
+            "scenario": scenario
+        }
+    
+    except Exception as e:
+        return {
+            "success": False,
+            "reason": str(e),
+            "scenario": scenario
+        }
 
-    # Fallback path
-    if scenario == "pod_kill":
-        print("[CHAOS] 🔧 Chaos Mesh unavailable — using kubectl fallback for pod_kill.")
-        return fallback_pod_kill(service)
+# ============================================================================
+# FUNCTION 4: Cleanup all scenarios
+# ============================================================================
 
-    print(f"[CHAOS] ❌ Chaos Mesh unavailable and '{scenario}' requires Chaos Mesh.")
+def cleanup_all() -> Dict[str, Any]:
+    """
+    Clean up all active chaos scenarios.
+    
+    Returns:
+        Dictionary with cleanup stats
+    """
+    results = []
+    success_count = 0
+    
+    for scenario in SCENARIO_MANIFEST.keys():
+        result = cleanup_chaos(scenario)
+        results.append(result)
+        if result.get("success"):
+            success_count += 1
+    
     return {
-        "success": False,
-        "reason": "chaos_mesh_required_for_this_scenario",
-        "scenario": scenario,
-        "service": service,
+        "cleaned": success_count,
+        "total": len(SCENARIO_MANIFEST),
+        "scenarios": results
     }
 
+# ============================================================================
+# FUNCTION 5: Fallback pod kill (kubectl only)
+# ============================================================================
 
-# ─────────────────────────────────────────────
-# QUICK SELF-TEST (run as script)
-# ─────────────────────────────────────────────
-if __name__ == "__main__":
-    import json as _json
+def fallback_pod_kill(service: str) -> Dict[str, Any]:
+    """
+    Fallback pod kill using kubectl directly (when Chaos Mesh unavailable).
+    
+    Args:
+        service: Target service
+    
+    Returns:
+        Dictionary with kill status
+    """
+    try:
+        # Step 1: Get the first pod of the service
+        get_pod_result = subprocess.run(
+            ["kubectl", "get", "pods", "-n", "boutique", 
+             "-l", f"app={service}", 
+             "-o", "jsonpath={.items[0].metadata.name}"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        if get_pod_result.returncode != 0:
+            return {
+                "success": False,
+                "reason": "could_not_find_pod",
+                "service": service,
+                "method": "kubectl_fallback"
+            }
+        
+        pod_name = get_pod_result.stdout.strip()
+        if not pod_name:
+            return {
+                "success": False,
+                "reason": "no_pods_found",
+                "service": service,
+                "method": "kubectl_fallback"
+            }
+        
+        # Step 2: Delete the pod
+        delete_result = subprocess.run(
+            ["kubectl", "delete", "pod", pod_name, "-n", "boutique"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        success = delete_result.returncode == 0
+        
+        print(f"[CHAOS] ⚡ Fallback pod kill: {pod_name}")
+        
+        return {
+            "success": success,
+            "pod_deleted": pod_name,
+            "service": service,
+            "method": "kubectl_fallback"
+        }
+    
+    except Exception as e:
+        return {
+            "success": False,
+            "reason": str(e),
+            "service": service,
+            "method": "kubectl_fallback"
+        }
 
-    print("\n=== KubeResilience Chaos Engine Self-Test ===\n")
+# ============================================================================
+# FUNCTION 5: Main entry point (called by FastAPI)
+# ============================================================================
 
-    print("1️⃣  Checking Chaos Mesh...")
-    available = check_chaos_mesh_available()
-
-    print("\n2️⃣  Testing critical service guard...")
-    result = inject_chaos_safe("frontend", "pod_kill")
-    print(_json.dumps(result, indent=2))
-
-    print("\n3️⃣  Dry-run: inject pod_kill into cartservice...")
-    result = inject_chaos_safe("cartservice", "pod_kill")
-    print(_json.dumps(result, indent=2))
-
-    print("\n4️⃣  Cleanup all...")
-    result = cleanup_all()
-    print(_json.dumps(result, indent=2))
-
-    print("\n=== Self-test complete ===")
+def inject_chaos_safe(service: str, scenario: str) -> Dict[str, Any]:
+    """
+    Main function called by FastAPI routes.
+    
+    Intelligently chooses:
+    - Chaos Mesh if available
+    - kubectl fallback if only pod_kill is requested
+    - Error if Chaos Mesh needed but unavailable
+    
+    Args:
+        service: Target service name
+        scenario: Chaos scenario
+    
+    Returns:
+        Injection result dictionary
+    """
+    # Check if Chaos Mesh is available
+    mesh_available = check_chaos_mesh_available()
+    
+    if mesh_available:
+        # Use Chaos Mesh
+        return inject_chaos(service, scenario)
+    else:
+        # Mesh is down. Can we fallback?
+        if scenario == "pod_kill":
+            # Only scenario we can handle without Chaos Mesh
+            return fallback_pod_kill(service)
+        else:
+            # Need Chaos Mesh for this scenario
+            return {
+                "success": False,
+                "reason": "chaos_mesh_required_for_this_scenario",
+                "scenario": scenario
+            }

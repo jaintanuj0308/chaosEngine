@@ -6,9 +6,9 @@ metadata:
 spec:
   action: pod-kill
   mode: one
-  duration: "30s"
   selector:
     namespaces:
       - boutique
     labelSelectors:
       app: SERVICE_PLACEHOLDER
+  duration: "30s"

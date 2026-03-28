@@ -6,7 +6,6 @@ metadata:
 spec:
   action: loss
   mode: one
-  duration: "60s"
   selector:
     namespaces:
       - boutique
@@ -15,4 +14,4 @@ spec:
   loss:
     loss: "45"
     correlation: "25"
-  direction: both
+  duration: "60s"

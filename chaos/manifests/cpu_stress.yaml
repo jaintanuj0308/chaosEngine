@@ -5,7 +5,6 @@ metadata:
   namespace: chaos-mesh
 spec:
   mode: one
-  duration: "60s"
   selector:
     namespaces:
       - boutique
@@ -15,3 +14,4 @@ spec:
     cpu:
       workers: 4
       load: 90
+  duration: "60s"

@@ -1,0 +1,11 @@
+apiVersion: kuberesilience.io/v1
+kind: ChaosProfile
+metadata:
+  name: resilience-test-alpha
+spec:
+  experiment: PodDeletion
+  targetSelector:
+    app: sample-app
+  intensity: 0.5
+  interval: 60s
+  duration: 10m

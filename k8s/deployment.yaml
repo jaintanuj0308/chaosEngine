@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kuberesilience-backend
+  labels:
+    app: kuberesilience-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: kuberesilience-backend
+  template:
+    metadata:
+      labels:
+        app: kuberesilience-backend
+    spec:
+      serviceAccountName: kuberesilience-sa
+      containers:
+      - name: chaos-engine
+        image: kuberesilience/chaos-engine:latest
+        ports:
+        - containerPort: 8080
+        envFrom:
+        - configMapRef:
+            name: kuberesilience-config
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+          requests:
+            cpu: "200m"
+            memory: "256Mi"

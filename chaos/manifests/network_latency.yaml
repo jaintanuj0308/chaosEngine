@@ -6,7 +6,6 @@ metadata:
 spec:
   action: delay
   mode: one
-  duration: "60s"
   selector:
     namespaces:
       - boutique
@@ -16,4 +15,4 @@ spec:
     latency: "300ms"
     jitter: "50ms"
     correlation: "25"
-  direction: both
+  duration: "60s"
